@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"golang.org/x/net/ipv4"
 	"log"
 	"net"
 	"net/http"
@@ -15,17 +16,17 @@ import (
 // function is for HTTPMU, and particularly SSDP.
 type HTTPUClient struct {
 	connLock sync.Mutex // Protects use of conn.
-	conn     net.PacketConn
+	conn     *ipv4.PacketConn
 }
 
 // NewHTTPUClient creates a new HTTPUClient, opening up a new UDP socket for the
 // purpose.
 func NewHTTPUClient() (*HTTPUClient, error) {
-	conn, err := net.ListenPacket("udp", ":0")
+	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
 		return nil, err
 	}
-	return &HTTPUClient{conn: conn}, nil
+	return &HTTPUClient{conn: ipv4.NewPacketConn(conn)}, nil
 }
 
 // Close shuts down the client. The client will no longer be useful following
@@ -73,13 +74,32 @@ func (httpu *HTTPUClient) Do(req *http.Request, timeout time.Duration, numSends 
 		return nil, err
 	}
 
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
 	// Send request.
 	for i := 0; i < numSends; i++ {
-		if n, err := httpu.conn.WriteTo(requestBuf.Bytes(), destAddr); err != nil {
-			return nil, err
-		} else if n < len(requestBuf.Bytes()) {
-			return nil, fmt.Errorf("httpu: wrote %d bytes rather than full %d in request",
-				n, len(requestBuf.Bytes()))
+
+		// send to every interface which support multicast
+		for _, ifc := range ifs {
+			if ifc.Flags&net.FlagMulticast == 0 {
+				// interface does not support multicast
+				continue
+			}
+
+			// set multicast interface to send the packet
+			if err := httpu.conn.SetMulticastInterface(&ifc); err != nil {
+				return nil, err
+			}
+
+			if n, err := httpu.conn.WriteTo(requestBuf.Bytes(), nil, destAddr); err != nil {
+				return nil, err
+			} else if n < len(requestBuf.Bytes()) {
+				return nil, fmt.Errorf("httpu: wrote %d bytes rather than full %d in request",
+					n, len(requestBuf.Bytes()))
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -89,7 +109,7 @@ func (httpu *HTTPUClient) Do(req *http.Request, timeout time.Duration, numSends 
 	responseBytes := make([]byte, 2048)
 	for {
 		// 2048 bytes should be sufficient for most networks.
-		n, _, err := httpu.conn.ReadFrom(responseBytes)
+		n, _, _, err := httpu.conn.ReadFrom(responseBytes)
 		if err != nil {
 			if err, ok := err.(net.Error); ok {
 				if err.Timeout() {
